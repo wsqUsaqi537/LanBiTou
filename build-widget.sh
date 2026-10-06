@@ -32,6 +32,7 @@ trap cleanup EXIT HUP INT TERM
 xcodebuild -project "$project_dir/LanBiTou.xcodeproj" -scheme LanBiTou \
   -configuration Debug -destination 'platform=macOS' -derivedDataPath "$build_dir" \
   CODE_SIGNING_ALLOWED=NO ENABLE_DEBUG_DYLIB=NO \
+  LANBITOU_ICLOUD_ENABLED=NO \
   LANBITOU_APP_GROUP=com.ban1et.lanbitou.preview.data \
   'LANBITOU_WIDGET_SNAPSHOT_PATH=Library/Application Support/com.ban1et.lanbitou/widget-reminders.json' \
   build > "$build_dir/build.log" 2>&1 || {

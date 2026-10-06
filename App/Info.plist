@@ -26,6 +26,12 @@
 	<string>$(LANBITOU_APP_GROUP)</string>
 	<key>WidgetSnapshotRelativePath</key>
 	<string>$(LANBITOU_WIDGET_SNAPSHOT_PATH)</string>
+	<key>ICloudSyncEnabled</key>
+	<string>$(LANBITOU_ICLOUD_ENABLED)</string>
+	<key>ICloudContainerIdentifier</key>
+	<string>$(LANBITOU_ICLOUD_CONTAINER)</string>
+	<key>ICloudEnvironment</key>
+	<string>$(LANBITOU_ICLOUD_ENVIRONMENT)</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

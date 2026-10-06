@@ -101,6 +101,17 @@ private struct ReminderTests {
             ("事项与年月日截止日期可编码往返", testCodableRoundTrip),
             ("仓库可保存并读取事项", testRepositorySaveAndLoad),
             ("仓库保存后的新增、编辑和删除可读取", testRepositoryCreateEditDelete),
+            ("首次迁移保留事项内容、ID和legacy原字节", testSyncMigrationPreservesLegacyData),
+            ("未变事项load和save不生成新版本", testUnchangedReminderKeepsVersion),
+            ("离线删除压过更早编辑且更晚编辑可恢复", testOfflineDeleteAndLaterEditMerge),
+            ("同时间按changeID字典序稳定选择版本", testSyncTieBreakIsStable),
+            ("旧上传确认不会清除较新的本地修改", testOldUploadAcknowledgementKeepsNewLocalEdit),
+            ("删除墓碑重启后保留且快照不含已删除项", testTombstonePersistsAndSnapshotOmitsDeleted),
+            ("坏同步文档和未知schema不会覆盖数据", testInvalidSyncStateIsPreserved),
+            ("同步状态与合并写快照失败时不改任何defaults键", testSyncSnapshotFailuresPreserveDefaults),
+            ("重复事项ID和不一致记录ID会被拒绝", testInvalidSyncIdentifiersAreRejected),
+            ("相同版本键的冲突payload会拒绝合并", testConflictingPayloadForSameVersionIsRejected),
+            ("只读defaults模式读取legacy但不迁移或写入", testReadOnlyDefaultsDoesNotMigrate),
             ("读取损坏数据会报错且保留原字节", testCorruptedDataIsPreserved),
             ("主仓库保存、编辑和删除会同步到只读快照", testSnapshotTracksHostChanges),
             ("首次读取legacy事项会导出快照且不改原数据", testLegacyLoadExportsSnapshot),
@@ -256,6 +267,381 @@ private struct ReminderTests {
         try expect(try repository.load().isEmpty, "删除后应读取到空列表")
     }
 
+    private static func testSyncMigrationPreservesLegacyData() throws {
+        try withTemporaryDirectory { directory in
+            let defaults = MemoryUserDefaults()
+            let createdAt = try date(2024, 8, 9, 10, 11, 12, calendar: utcCalendar())
+            let original = reminder(
+                "legacy标题",
+                id: UUID(uuidString: "10234567-89AB-CDEF-0123-456789ABCDEF")!,
+                createdAt: createdAt,
+                notes: "legacy备注"
+            )
+            let legacyBytes = try JSONEncoder().encode([original])
+            defaults.set(legacyBytes, forKey: "reminders.json")
+            let snapshotURL = directory.appendingPathComponent("widget-reminders.json")
+            let repository = ReminderRepository(defaults: defaults, snapshotURL: snapshotURL)
+
+            let state = try repository.loadSyncState()
+            try expect(defaults.data(forKey: "reminders.json") == legacyBytes, "首次迁移不能改写legacy原字节")
+            try expect(try repository.load() == [original], "迁移后load应返回原事项")
+            try expect(state.entries.count == 1, "每个legacy事项应有一条版本记录")
+            try expect(state.entries[0].record.id == original.id, "迁移应保留事项ID")
+            try expect(state.entries[0].record.reminder == original, "迁移应保留全部事项字段")
+            try expect(state.entries[0].record.modifiedAt == createdAt, "迁移版本时间应沿用createdAt")
+            try expect(state.entries[0].needsUpload, "迁移记录应等待上传")
+            try expect(defaults.data(forKey: "reminders.sync.v1") != nil, "迁移应保存独立同步文档")
+            try expect(try ReminderRepository(snapshotURL: snapshotURL).load() == [original], "迁移快照应保持legacy事项")
+        }
+    }
+
+    private static func testUnchangedReminderKeepsVersion() throws {
+        let defaults = MemoryUserDefaults()
+        let repository = ReminderRepository(defaults: defaults)
+        let item = reminder("不变事项", id: UUID())
+        let firstSave = try date(2025, 1, 2, calendar: utcCalendar())
+        try repository.save([item], at: firstSave)
+        let originalState = try repository.loadSyncState()
+
+        _ = try repository.load()
+        try repository.save([item], at: try date(2026, 1, 2, calendar: utcCalendar()))
+        let finalState = try repository.loadSyncState()
+        try expect(finalState == originalState, "load和未变save都不应改变事项版本或dirty状态")
+    }
+
+    private static func testOfflineDeleteAndLaterEditMerge() throws {
+        let id = UUID(uuidString: "20234567-89AB-CDEF-0123-456789ABCDEF")!
+        let baseTime = try date(2025, 1, 1, calendar: utcCalendar())
+        let editTime = try date(2025, 1, 2, calendar: utcCalendar())
+        let deleteTime = try date(2025, 1, 3, calendar: utcCalendar())
+        let laterEditTime = try date(2025, 1, 4, calendar: utcCalendar())
+        let original = reminder("原事项", id: id, createdAt: baseTime)
+        let baseEntry = syncEntry(id: id, reminder: original, modifiedAt: baseTime, changeID: "00000000-0000-0000-0000-000000000010")
+        let baseState = ReminderSyncState(entries: [baseEntry])
+
+        let editDefaults = MemoryUserDefaults()
+        let editRepository = ReminderRepository(defaults: editDefaults)
+        try editRepository.saveSyncState(baseState)
+        try editRepository.save([reminder("离线编辑", id: id, createdAt: baseTime)], at: editTime)
+
+        let deleteDefaults = MemoryUserDefaults()
+        let deleteRepository = ReminderRepository(defaults: deleteDefaults)
+        try deleteRepository.saveSyncState(baseState)
+        try deleteRepository.save([], at: deleteTime)
+        try deleteRepository.mergeCloudRecords(try editRepository.loadSyncState().entries)
+        let deletedState = try deleteRepository.loadSyncState()
+        try expect(deletedState.entries[0].record.reminder == nil, "时间更晚的删除应压过离线编辑")
+        try expect(deletedState.entries[0].record.modifiedAt == deleteTime, "删除墓碑应保留删除时间")
+        try expect(deletedState.entries[0].needsUpload, "本地较新的删除仍应等待上传")
+
+        let tombstone = deletedState.entries[0]
+        let editAgainDefaults = MemoryUserDefaults()
+        let editAgainRepository = ReminderRepository(defaults: editAgainDefaults)
+        try editAgainRepository.saveSyncState(ReminderSyncState(entries: [tombstone]))
+        let restored = reminder("删除后的离线编辑", id: id, createdAt: baseTime)
+        try editAgainRepository.save([restored], at: laterEditTime)
+        let restoredEntry = try editAgainRepository.loadSyncState().entries[0]
+
+        let otherDefaults = MemoryUserDefaults()
+        let otherRepository = ReminderRepository(defaults: otherDefaults)
+        try otherRepository.saveSyncState(ReminderSyncState(entries: [tombstone]))
+        try otherRepository.mergeCloudRecords([restoredEntry])
+        let merged = try otherRepository.loadSyncState().entries[0]
+        try expect(merged.record.reminder == restored, "比删除时间更晚的编辑应重新显示事项")
+        try expect(!merged.needsUpload, "采用云端较新编辑后应清除dirty")
+    }
+
+    private static func testSyncTieBreakIsStable() throws {
+        let id = UUID(uuidString: "30234567-89AB-CDEF-0123-456789ABCDEF")!
+        let sameTime = try date(2025, 5, 6, calendar: utcCalendar())
+        let lower = syncEntry(
+            id: id,
+            reminder: reminder("字典序较小", id: id),
+            modifiedAt: sameTime,
+            changeID: "00000000-0000-0000-0000-000000000001"
+        )
+        let higher = syncEntry(
+            id: id,
+            reminder: reminder("字典序较大", id: id),
+            modifiedAt: sameTime,
+            changeID: "00000000-0000-0000-0000-000000000002"
+        )
+        try expect(higher.record.isNewer(than: lower.record), "同时间应由字典序较大的changeID胜出")
+
+        let firstRepository = ReminderRepository(defaults: MemoryUserDefaults())
+        try firstRepository.mergeCloudRecords([lower])
+        try firstRepository.mergeCloudRecords([higher])
+        let first = try firstRepository.loadSyncState().entries[0].record
+
+        let secondRepository = ReminderRepository(defaults: MemoryUserDefaults())
+        try secondRepository.mergeCloudRecords([higher])
+        try secondRepository.mergeCloudRecords([lower])
+        let second = try secondRepository.loadSyncState().entries[0].record
+        try expect(first == second, "不同到达顺序应收敛到同一版本")
+        try expect(first.reminder?.title == "字典序较大", "changeID字典序较大的一方应胜出")
+    }
+
+    private static func testOldUploadAcknowledgementKeepsNewLocalEdit() throws {
+        let defaults = MemoryUserDefaults()
+        let repository = ReminderRepository(defaults: defaults)
+        let id = UUID()
+        let firstTime = try date(2025, 6, 1, calendar: utcCalendar())
+        let secondTime = try date(2025, 6, 2, calendar: utcCalendar())
+        try repository.save([reminder("首次修改", id: id)], at: firstTime)
+        var acknowledgement = try repository.loadSyncState().entries[0]
+        acknowledgement.cloudSystemFields = Data("server-tag".utf8)
+        acknowledgement.needsUpload = false
+
+        let newer = reminder("更新的本地修改", id: id)
+        try repository.save([newer], at: secondTime)
+        try repository.mergeCloudRecords([acknowledgement])
+        let result = try repository.loadSyncState().entries[0]
+        try expect(result.record.reminder == newer, "旧上传确认不能覆盖较新的本地内容")
+        try expect(result.record.modifiedAt == secondTime, "本地较新版本时间应保留")
+        try expect(result.needsUpload, "较新的本地版本仍应标记dirty")
+        try expect(result.cloudSystemFields == Data("server-tag".utf8), "即使ACK版本较旧也要采用最新收到的server fields")
+    }
+
+    private static func testTombstonePersistsAndSnapshotOmitsDeleted() throws {
+        try withTemporaryDirectory { directory in
+            let defaults = MemoryUserDefaults()
+            let snapshotURL = directory.appendingPathComponent("widget-reminders.json")
+            let repository = ReminderRepository(defaults: defaults, snapshotURL: snapshotURL)
+            let item = reminder("即将删除", id: UUID())
+            try repository.save([item])
+            try repository.save([])
+
+            let snapshot = try JSONDecoder().decode([Reminder].self, from: Data(contentsOf: snapshotURL))
+            try expect(snapshot.isEmpty, "小组件快照只应包含live事项")
+            let restarted = ReminderRepository(defaults: defaults, snapshotURL: snapshotURL)
+            let state = try restarted.loadSyncState()
+            try expect(state.entries.count == 1 && state.entries[0].record.reminder == nil, "重启后删除墓碑应保留")
+            try expect(try restarted.load().isEmpty, "墓碑事项不应重新出现在load结果")
+            try expect(try restarted.loadSyncState().entries.count == 1, "load不能清理墓碑")
+        }
+    }
+
+    private static func testInvalidSyncStateIsPreserved() throws {
+        for invalidState in [
+            Data("{broken sync document".utf8),
+            Data(#"{"schemaVersion":99,"entries":[]}"#.utf8)
+        ] {
+            try withTemporaryDirectory { directory in
+                let defaults = MemoryUserDefaults()
+                let legacy = try JSONEncoder().encode([reminder("legacy", id: UUID())])
+                let snapshotURL = directory.appendingPathComponent("widget-reminders.json")
+                let snapshot = Data("existing snapshot".utf8)
+                defaults.set(legacy, forKey: "reminders.json")
+                defaults.set(invalidState, forKey: "reminders.sync.v1")
+                try snapshot.write(to: snapshotURL)
+                let repository = ReminderRepository(defaults: defaults, snapshotURL: snapshotURL)
+
+                do {
+                    _ = try repository.load()
+                } catch {
+                    try expect(defaults.data(forKey: "reminders.sync.v1") == invalidState, "坏同步文档字节必须保留")
+                    try expect(defaults.data(forKey: "reminders.json") == legacy, "失败读取不能改legacy键")
+                    try expect(try Data(contentsOf: snapshotURL) == snapshot, "失败读取不能覆盖已有快照")
+                    return
+                }
+                throw TestFailure.expectation("损坏或未知schema同步文档应拒绝读取")
+            }
+        }
+    }
+
+    private static func testSyncSnapshotFailuresPreserveDefaults() throws {
+        try withTemporaryDirectory { directory in
+            let blocker = directory.appendingPathComponent("not-a-directory")
+            try Data("blocker".utf8).write(to: blocker)
+            let snapshotURL = blocker.appendingPathComponent("widget-reminders.json")
+
+            let migrationDefaults = MemoryUserDefaults()
+            let legacy = try JSONEncoder().encode([reminder("legacy", id: UUID())])
+            migrationDefaults.set(legacy, forKey: "reminders.json")
+            let migration = ReminderRepository(defaults: migrationDefaults, snapshotURL: snapshotURL)
+            try expectSnapshotWriteFailure { _ = try migration.loadSyncState() }
+            try expect(migrationDefaults.data(forKey: "reminders.sync.v1") == nil, "迁移快照失败不能创建同步键")
+            try expect(migrationDefaults.data(forKey: "reminders.json") == legacy, "迁移快照失败不能改legacy键")
+
+            let stateID = UUID()
+            let validState = ReminderSyncState(entries: [syncEntry(
+                id: stateID,
+                reminder: reminder("原值", id: stateID),
+                modifiedAt: Date(timeIntervalSince1970: 0),
+                changeID: "40234567-89AB-CDEF-0123-456789ABCDEF"
+            )])
+            let originalSyncBytes = try JSONEncoder().encode(validState)
+            let originalLegacyBytes = Data("legacy bytes".utf8)
+
+            let saveDefaults = MemoryUserDefaults()
+            saveDefaults.set(originalSyncBytes, forKey: "reminders.sync.v1")
+            saveDefaults.set(originalLegacyBytes, forKey: "reminders.json")
+            let saveRepository = ReminderRepository(defaults: saveDefaults, snapshotURL: snapshotURL)
+            var changedState = validState
+            changedState.cloudAccountID = "new-account"
+            try expectSnapshotWriteFailure { try saveRepository.saveSyncState(changedState) }
+            try expect(saveDefaults.data(forKey: "reminders.sync.v1") == originalSyncBytes, "saveSyncState快照失败不能改同步键")
+            try expect(saveDefaults.data(forKey: "reminders.json") == originalLegacyBytes, "saveSyncState快照失败不能改legacy键")
+
+            let mergeDefaults = MemoryUserDefaults()
+            mergeDefaults.set(originalSyncBytes, forKey: "reminders.sync.v1")
+            mergeDefaults.set(originalLegacyBytes, forKey: "reminders.json")
+            let mergeRepository = ReminderRepository(defaults: mergeDefaults, snapshotURL: snapshotURL)
+            let otherID = UUID()
+            let cloudEntry = syncEntry(
+                id: otherID,
+                reminder: reminder("云端新增", id: otherID),
+                modifiedAt: Date(),
+                changeID: "50234567-89AB-CDEF-0123-456789ABCDEF"
+            )
+            try expectSnapshotWriteFailure { try mergeRepository.mergeCloudRecords([cloudEntry]) }
+            try expect(mergeDefaults.data(forKey: "reminders.sync.v1") == originalSyncBytes, "merge快照失败不能改同步键")
+            try expect(mergeDefaults.data(forKey: "reminders.json") == originalLegacyBytes, "merge快照失败不能改legacy键")
+        }
+    }
+
+    private static func testInvalidSyncIdentifiersAreRejected() throws {
+        let id = UUID()
+        let first = syncEntry(id: id, reminder: reminder("重复1", id: id), modifiedAt: Date(), changeID: UUID())
+        let duplicate = syncEntry(id: id, reminder: reminder("重复2", id: id), modifiedAt: Date(), changeID: UUID())
+        let defaults = MemoryUserDefaults()
+        let repository = ReminderRepository(defaults: defaults)
+        do {
+            try repository.saveSyncState(ReminderSyncState(entries: [first, duplicate]))
+        } catch let error as ReminderRepositoryError {
+            guard case .invalidStoredValue = error else {
+                throw TestFailure.expectation("重复ID应返回invalidStoredValue，实际为\(error)")
+            }
+        }
+        try expect(defaults.data(forKey: "reminders.sync.v1") == nil, "重复ID失败不能写同步键")
+
+        let mismatched = syncEntry(
+            id: id,
+            reminder: reminder("ID不一致", id: UUID()),
+            modifiedAt: Date(),
+            changeID: UUID()
+        )
+        do {
+            try repository.saveSyncState(ReminderSyncState(entries: [mismatched]))
+        } catch let error as ReminderRepositoryError {
+            guard case .invalidStoredValue = error else {
+                throw TestFailure.expectation("不一致ID应返回invalidStoredValue，实际为\(error)")
+            }
+            try expect(defaults.data(forKey: "reminders.sync.v1") == nil, "ID不一致失败不能写同步键")
+            return
+        }
+        throw TestFailure.expectation("不一致的记录ID和事项ID不应被保存")
+    }
+
+    private static func testConflictingPayloadForSameVersionIsRejected() throws {
+        let id = UUID()
+        let time = try date(2025, 7, 8, calendar: utcCalendar())
+        let version = UUID(uuidString: "60234567-89AB-CDEF-0123-456789ABCDEF")!
+        let local = syncEntry(
+            id: id,
+            reminder: reminder("本地payload", id: id),
+            modifiedAt: time,
+            changeID: version
+        )
+        let defaults = MemoryUserDefaults()
+        let repository = ReminderRepository(defaults: defaults)
+        try repository.saveSyncState(ReminderSyncState(entries: [local]))
+        let originalSync = defaults.data(forKey: "reminders.sync.v1")
+        let originalLegacy = defaults.data(forKey: "reminders.json")
+        let conflicting = syncEntry(
+            id: id,
+            reminder: reminder("冲突payload", id: id),
+            modifiedAt: time,
+            changeID: version
+        )
+
+        do {
+            try repository.mergeCloudRecords([conflicting])
+        } catch let error as ReminderRepositoryError {
+            guard case .invalidStoredValue = error else {
+                throw TestFailure.expectation("同版本payload冲突应返回invalidStoredValue，实际为\(error)")
+            }
+            try expect(defaults.data(forKey: "reminders.sync.v1") == originalSync, "同版本冲突不能改同步文档")
+            try expect(defaults.data(forKey: "reminders.json") == originalLegacy, "同版本冲突不能改legacy键")
+            return
+        }
+        throw TestFailure.expectation("同版本键但不同payload应拒绝合并")
+    }
+
+    private static func testReadOnlyDefaultsDoesNotMigrate() throws {
+        let defaults = MemoryUserDefaults()
+        let item = reminder("只读legacy", id: UUID())
+        let legacy = try JSONEncoder().encode([item])
+        defaults.set(legacy, forKey: "reminders.json")
+        let repository = ReminderRepository(defaults: defaults, readOnly: true)
+
+        try expect(try repository.load() == [item], "只讀defaults模式应读取legacy事项")
+        try expect(defaults.data(forKey: "reminders.sync.v1") == nil, "只读defaults load不能迁移同步文档")
+        try expect(defaults.data(forKey: "reminders.json") == legacy, "只读defaults load不能改legacy原字节")
+        try expectReadOnly { _ = try repository.loadSyncState() }
+        try expectReadOnly { try repository.save([item]) }
+        try expectReadOnly { try repository.saveSyncState(ReminderSyncState(entries: [])) }
+        try expectReadOnly { try repository.mergeCloudRecords([]) }
+        try expect(defaults.data(forKey: "reminders.sync.v1") == nil, "只读操作都不能创建同步文档")
+    }
+
+    private static func syncEntry(
+        id: UUID,
+        reminder: Reminder?,
+        modifiedAt: Date,
+        changeID: String,
+        cloudSystemFields: Data? = nil,
+        needsUpload: Bool = true
+    ) -> ReminderSyncEntry {
+        syncEntry(
+            id: id,
+            reminder: reminder,
+            modifiedAt: modifiedAt,
+            changeID: UUID(uuidString: changeID)!,
+            cloudSystemFields: cloudSystemFields,
+            needsUpload: needsUpload
+        )
+    }
+
+    private static func syncEntry(
+        id: UUID,
+        reminder: Reminder?,
+        modifiedAt: Date,
+        changeID: UUID,
+        cloudSystemFields: Data? = nil,
+        needsUpload: Bool = true
+    ) -> ReminderSyncEntry {
+        ReminderSyncEntry(
+            record: ReminderSyncRecord(id: id, reminder: reminder, modifiedAt: modifiedAt, changeID: changeID),
+            cloudSystemFields: cloudSystemFields,
+            needsUpload: needsUpload
+        )
+    }
+
+    private static func expectSnapshotWriteFailure(_ operation: () throws -> Void) throws {
+        do {
+            try operation()
+        } catch let error as ReminderRepositoryError {
+            guard case .snapshotWriteFailed = error else {
+                throw TestFailure.expectation("预期快照写失败，实际为\(error)")
+            }
+            return
+        }
+        throw TestFailure.expectation("快照路径阻塞时操作应失败")
+    }
+
+    private static func expectReadOnly(_ operation: () throws -> Void) throws {
+        do {
+            try operation()
+        } catch let error as ReminderRepositoryError {
+            guard case .readOnly = error else {
+                throw TestFailure.expectation("只读操作应返回readOnly，实际为\(error)")
+            }
+            return
+        }
+        throw TestFailure.expectation("只读操作应失败")
+    }
+
     private static func testCorruptedDataIsPreserved() throws {
         let defaults = MemoryUserDefaults()
         let repository = ReminderRepository(defaults: defaults)
@@ -337,6 +723,7 @@ private struct ReminderTests {
 
             try expect(rejectedSave, "快照写入失败时save必须抛错")
             try expect(defaults.data(forKey: "reminders.json") == originalData, "快照写失败后必须保留原defaults字节")
+            try expect(defaults.data(forKey: "reminders.sync.v1") == nil, "快照写失败后不能创建同步文档")
         }
     }
 

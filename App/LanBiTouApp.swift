@@ -26,14 +26,24 @@ struct LanBiTouApp: App {
 private final class ReminderStore: ObservableObject {
     @Published private(set) var reminders: [Reminder] = []
     @Published private(set) var isReady = false
+    @Published private(set) var syncStatusText = "本地保存 · iCloud 待配置"
     @Published var errorMessage: String?
 
     private let repository: ReminderRepository
+    private let cloudSync: ReminderCloudSync
     private var lastCheckedDate: DueDate?
 
     init(repository: ReminderRepository = ReminderRepository()) {
         self.repository = repository
+        cloudSync = ReminderCloudSync(repository: repository)
+        cloudSync.onChange = { [weak self] in
+            self?.refreshAndClean(at: Date(), force: true)
+        }
+        cloudSync.onStatusChange = { [weak self] status in
+            self?.syncStatusText = status
+        }
         refreshAndClean(at: Date(), force: true)
+        Task { await cloudSync.start() }
     }
 
     func refreshAndClean(at date: Date = Date(), force: Bool = false) {
@@ -46,7 +56,7 @@ private final class ReminderStore: ObservableObject {
             let cleaned = Reminder.visible(from: loaded, at: date)
             if cleaned.count != loaded.count {
                 do {
-                    try repository.save(cleaned)
+                    try repository.save(cleaned, at: date)
                     reminders = cleaned
                 } catch {
                     reminders = loaded
@@ -60,6 +70,7 @@ private final class ReminderStore: ObservableObject {
 
             errorMessage = nil
             lastCheckedDate = today
+            cloudSync.localDataDidChange()
             WidgetCenter.shared.reloadAllTimelines()
         } catch {
             isReady = false
@@ -106,6 +117,10 @@ private final class ReminderStore: ObservableObject {
         try persist(current.filter { $0.id != id }, at: now)
     }
 
+    func syncWithCloud() {
+        Task { await cloudSync.syncNow() }
+    }
+
     private func validatedTitle(_ title: String, dueDate: DueDate?, at date: Date) throws -> String {
         guard isReady else { throw ReminderStoreError.storageUnavailable }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -120,7 +135,7 @@ private final class ReminderStore: ObservableObject {
         guard isReady else { throw ReminderStoreError.storageUnavailable }
         let cleaned = Reminder.visible(from: candidate, at: date)
         do {
-            try repository.save(cleaned)
+            try repository.save(cleaned, at: date)
         } catch {
             errorMessage = error.localizedDescription
             throw error
@@ -129,6 +144,7 @@ private final class ReminderStore: ObservableObject {
         reminders = cleaned
         errorMessage = nil
         lastCheckedDate = DueDate(date: date)
+        cloudSync.localDataDidChange()
         WidgetCenter.shared.reloadAllTimelines()
     }
 }
@@ -297,6 +313,7 @@ private struct ReminderHomeView: View {
         let now = Date()
         currentDate = now
         store.refreshAndClean(at: now, force: true)
+        store.syncWithCloud()
         scheduleNextMidnight(after: now)
     }
 
@@ -356,9 +373,11 @@ private struct ReminderHomeView: View {
                 Circle()
                     .fill(store.isReady ? Color.green.opacity(0.75) : Color.orange)
                     .frame(width: 7, height: 7)
-                Text(store.isReady ? "仅在此设备保存" : "存储暂不可用")
+                Text(store.isReady ? store.syncStatusText : "存储暂不可用")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.mutedInk)
+                    .lineLimit(2)
+                    .help(store.syncStatusText)
             }
             .padding(.horizontal, 8)
         }
