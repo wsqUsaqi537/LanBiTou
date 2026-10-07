@@ -29,3 +29,14 @@ swiftc \
   -o "$build_dir/cloud-sync-tests"
 
 "$build_dir/cloud-sync-tests"
+
+swiftc \
+  -swift-version 5 \
+  -sdk "$(xcrun --sdk macosx --show-sdk-path)" \
+  -target "$(uname -m)-apple-macosx14.0" \
+  "$project_dir/App/ReminderNotifications.swift" \
+  "$tests_dir/NotificationTests.swift" \
+  -module-cache-path "$build_dir/module-cache" \
+  -o "$build_dir/notification-tests"
+
+"$build_dir/notification-tests"

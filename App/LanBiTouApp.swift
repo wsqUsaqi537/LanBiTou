@@ -1,6 +1,7 @@
 import Combine
 import AppKit
 import SwiftUI
+import UserNotifications
 import WidgetKit
 
 @main
@@ -9,7 +10,7 @@ struct LanBiTouApp: App {
 
     var body: some Scene {
         WindowGroup("烂笔头", id: "main") {
-            ReminderHomeView(store: store)
+            ReminderHomeView(store: store, notifications: store.notifications)
                 .frame(minWidth: 760, minHeight: 560)
                 .preferredColorScheme(.light)
                 .handlesExternalEvents(preferring: ["lanbitou://open"], allowing: ["lanbitou://open"])
@@ -31,7 +32,10 @@ private final class ReminderStore: ObservableObject {
 
     private let repository: ReminderRepository
     private let cloudSync: ReminderCloudSync
+    let notifications = ReminderNotifications()
     private var lastCheckedDate: DueDate?
+    private var expirationTimer: Timer?
+    private var lifecycleSubscriptions = Set<AnyCancellable>()
 
     init(repository: ReminderRepository = ReminderRepository()) {
         self.repository = repository
@@ -42,8 +46,26 @@ private final class ReminderStore: ObservableObject {
         cloudSync.onStatusChange = { [weak self] status in
             self?.syncStatusText = status
         }
+        notifications.onOpenApp = {
+            if let url = URL(string: "lanbitou://open") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+        NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshAndClean(at: Date(), force: true)
+            }
+            .store(in: &lifecycleSubscriptions)
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshAndClean(at: Date(), force: true)
+            }
+            .store(in: &lifecycleSubscriptions)
         refreshAndClean(at: Date(), force: true)
         Task { await cloudSync.start() }
+        Task { await notifications.refreshAuthorization() }
     }
 
     func refreshAndClean(at date: Date = Date(), force: Bool = false) {
@@ -71,6 +93,7 @@ private final class ReminderStore: ObservableObject {
             errorMessage = nil
             lastCheckedDate = today
             cloudSync.localDataDidChange()
+            updateNotificationsAndExpiration(at: date)
             WidgetCenter.shared.reloadAllTimelines()
         } catch {
             isReady = false
@@ -78,37 +101,43 @@ private final class ReminderStore: ObservableObject {
         }
     }
 
-    func add(title: String, notes: String, dueDate: DueDate?) throws {
+    func add(title: String, notes: String, dueDate: DueDate?, dueTime: DueTime?, remindAt: Date?) throws {
         let now = Date()
-        let cleanTitle = try validatedTitle(title, dueDate: dueDate, at: now)
         let current = Reminder.visible(from: reminders, at: now)
-        let reminder = Reminder(
+        var reminder = Reminder(
             id: UUID(),
-            title: cleanTitle,
+            title: title,
             notes: notes,
             dueDate: dueDate,
-            createdAt: now
+            createdAt: now,
+            dueTime: dueDate == nil ? nil : dueTime,
+            remindAt: remindAt
         )
+        reminder.title = try validatedTitle(title, reminder: reminder, previous: nil, at: now)
         try persist(current + [reminder], at: now)
+        requestNotificationPermissionIfNeeded(for: reminder)
     }
 
-    func update(id: UUID, title: String, notes: String, dueDate: DueDate?) throws {
+    func update(id: UUID, title: String, notes: String, dueDate: DueDate?, dueTime: DueTime?, remindAt: Date?) throws {
         let now = Date()
-        let cleanTitle = try validatedTitle(title, dueDate: dueDate, at: now)
         let current = Reminder.visible(from: reminders, at: now)
         guard let existing = current.first(where: { $0.id == id }) else {
             try persist(current, at: now)
             throw ReminderStoreError.expired
         }
 
-        let updated = Reminder(
+        var updated = Reminder(
             id: existing.id,
-            title: cleanTitle,
+            title: title,
             notes: notes,
             dueDate: dueDate,
-            createdAt: existing.createdAt
+            createdAt: existing.createdAt,
+            dueTime: dueDate == nil ? nil : dueTime,
+            remindAt: remindAt
         )
+        updated.title = try validatedTitle(title, reminder: updated, previous: existing, at: now)
         try persist(current.map { $0.id == id ? updated : $0 }, at: now)
+        requestNotificationPermissionIfNeeded(for: updated)
     }
 
     func delete(id: UUID) throws {
@@ -121,12 +150,20 @@ private final class ReminderStore: ObservableObject {
         Task { await cloudSync.syncNow() }
     }
 
-    private func validatedTitle(_ title: String, dueDate: DueDate?, at date: Date) throws -> String {
+    private func validatedTitle(_ title: String, reminder: Reminder, previous: Reminder?, at date: Date) throws -> String {
         guard isReady else { throw ReminderStoreError.storageUnavailable }
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanTitle.isEmpty else { throw ReminderStoreError.blankTitle }
-        if let dueDate, dueDate < DueDate(date: date) {
+        if let deadline = reminder.expirationDate(), deadline <= date {
             throw ReminderStoreError.dueDateInPast
+        }
+        if let remindAt = reminder.remindAt {
+            if remindAt <= date && remindAt != previous?.remindAt {
+                throw ReminderStoreError.reminderInPast
+            }
+            if let deadline = reminder.expirationDate(), remindAt >= deadline {
+                throw ReminderStoreError.reminderAfterDeadline
+            }
         }
         return cleanTitle
     }
@@ -145,7 +182,42 @@ private final class ReminderStore: ObservableObject {
         errorMessage = nil
         lastCheckedDate = DueDate(date: date)
         cloudSync.localDataDidChange()
+        updateNotificationsAndExpiration(at: date)
         WidgetCenter.shared.reloadAllTimelines()
+    }
+
+    private func requestNotificationPermissionIfNeeded(for reminder: Reminder) {
+        guard reminder.remindAt != nil else { return }
+        Task {
+            await notifications.refreshAuthorization()
+            if notifications.authorizationStatus == .notDetermined {
+                await notifications.requestAuthorization()
+            }
+        }
+    }
+
+    private func updateNotificationsAndExpiration(at date: Date) {
+        notifications.reconcile(reminders.map { reminder in
+            let body: String
+            if let dueDate = reminder.dueDate {
+                let day = dueDate.date().formatted(date: .abbreviated, time: .omitted)
+                body = reminder.dueTime.map { "截止时间：\(day) \($0.timeLabel)" } ?? "截止日期：\(day)"
+            } else {
+                body = "你为这条事项设置了提醒。"
+            }
+            return ReminderNotificationItem(id: reminder.id, title: reminder.title, body: body, remindAt: reminder.remindAt)
+        })
+
+        expirationTimer?.invalidate()
+        expirationTimer = nil
+        guard let next = reminders.compactMap({ $0.expirationDate() }).filter({ $0 > date }).min() else { return }
+        let timer = Timer(fire: next, interval: 0, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshAndClean(at: Date(), force: true)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        expirationTimer = timer
     }
 }
 
@@ -154,6 +226,8 @@ private enum ReminderStoreError: LocalizedError {
     case blankTitle
     case dueDateInPast
     case expired
+    case reminderInPast
+    case reminderAfterDeadline
 
     var errorDescription: String? {
         switch self {
@@ -162,9 +236,13 @@ private enum ReminderStoreError: LocalizedError {
         case .blankTitle:
             return "请填写事项标题。"
         case .dueDateInPast:
-            return "截止日期不能早于今天。"
+            return "截止时间必须晚于现在。"
         case .expired:
             return "这条事项已过期，已从列表中移除。"
+        case .reminderInPast:
+            return "提醒时间必须晚于现在。"
+        case .reminderAfterDeadline:
+            return "提醒时间必须早于截止时间。"
         }
     }
 }
@@ -205,6 +283,7 @@ private struct EditorTarget: Identifiable {
 
 private struct ReminderHomeView: View {
     @ObservedObject var store: ReminderStore
+    @ObservedObject var notifications: ReminderNotifications
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var selectedFilter: ReminderFilter = .all
@@ -272,11 +351,11 @@ private struct ReminderHomeView: View {
             ReminderEditor(
                 reminder: target.reminder,
                 canMutate: store.isReady,
-                onSave: { title, notes, dueDate in
+                onSave: { title, notes, dueDate, dueTime, remindAt in
                     if let reminder = target.reminder {
-                        try store.update(id: reminder.id, title: title, notes: notes, dueDate: dueDate)
+                        try store.update(id: reminder.id, title: title, notes: notes, dueDate: dueDate, dueTime: dueTime, remindAt: remindAt)
                     } else {
-                        try store.add(title: title, notes: notes, dueDate: dueDate)
+                        try store.add(title: title, notes: notes, dueDate: dueDate, dueTime: dueTime, remindAt: remindAt)
                     }
                 },
                 onDelete: { id in
@@ -314,6 +393,7 @@ private struct ReminderHomeView: View {
         currentDate = now
         store.refreshAndClean(at: now, force: true)
         store.syncWithCloud()
+        Task { await notifications.refreshAuthorization() }
         scheduleNextMidnight(after: now)
     }
 
@@ -368,6 +448,31 @@ private struct ReminderHomeView: View {
             }
 
             Spacer(minLength: 12)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Label(notifications.statusText, systemImage: "bell")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Color.mutedInk)
+                    .lineLimit(3)
+                    .help(notifications.statusText)
+                if notifications.authorizationStatus == .notDetermined {
+                    Button("开启通知") {
+                        Task { await notifications.requestAuthorization() }
+                    }
+                    .controlSize(.small)
+                } else {
+                    Button("系统通知设置") {
+                        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.systempreferences") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .controlSize(.small)
+                    Text("系统设置 → 通知 → 烂笔头")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.mutedInk)
+                }
+            }
+            .padding(.horizontal, 8)
 
             HStack(spacing: 8) {
                 Circle()
@@ -556,6 +661,14 @@ private struct ReminderHomeView: View {
                     }
                     deadlineLabel(for: reminder)
                         .padding(.top, 2)
+                    if let remindAt = reminder.remindAt {
+                        Label(
+                            "提醒 \(remindAt.formatted(date: .abbreviated, time: .shortened))",
+                            systemImage: "bell"
+                        )
+                        .font(.system(size: 10))
+                        .foregroundStyle(Color.mutedInk)
+                    }
                 }
 
                 Image(systemName: "chevron.right")
@@ -589,7 +702,7 @@ private struct ReminderHomeView: View {
         if let dueDate = reminder.dueDate {
             let isToday = dueDate == DueDate(date: currentDate)
             Label(
-                isToday ? "今天截止" : dueDate.date().formatted(date: .long, time: .omitted),
+                deadlineText(dueDate: dueDate, dueTime: reminder.dueTime, isToday: isToday),
                 systemImage: "calendar"
             )
             .font(.system(size: 10, weight: isToday ? .semibold : .regular))
@@ -600,6 +713,12 @@ private struct ReminderHomeView: View {
                 .foregroundStyle(Color.mutedInk)
         }
     }
+
+    private func deadlineText(dueDate: DueDate, dueTime: DueTime?, isToday: Bool) -> String {
+        let day = isToday ? "今天" : dueDate.date().formatted(date: .long, time: .omitted)
+        if let dueTime { return "\(day) \(dueTime.timeLabel) 截止" }
+        return isToday ? "今天截止（全天）" : "\(day) 截止（全天）"
+    }
 }
 
 private struct ReminderEditor: View {
@@ -607,13 +726,16 @@ private struct ReminderEditor: View {
 
     let reminder: Reminder?
     let canMutate: Bool
-    let onSave: (String, String, DueDate?) throws -> Void
+    let onSave: (String, String, DueDate?, DueTime?, Date?) throws -> Void
     let onDelete: (UUID) throws -> Void
 
     @State private var title: String
     @State private var notes: String
     @State private var hasDueDate: Bool
     @State private var dueDate: Date
+    @State private var hasDueTime: Bool
+    @State private var hasReminder: Bool
+    @State private var remindAt: Date
     @State private var showingDeleteConfirmation = false
     @State private var showingError = false
     @State private var errorMessage = ""
@@ -621,7 +743,7 @@ private struct ReminderEditor: View {
     init(
         reminder: Reminder?,
         canMutate: Bool,
-        onSave: @escaping (String, String, DueDate?) throws -> Void,
+        onSave: @escaping (String, String, DueDate?, DueTime?, Date?) throws -> Void,
         onDelete: @escaping (UUID) throws -> Void
     ) {
         self.reminder = reminder
@@ -631,7 +753,11 @@ private struct ReminderEditor: View {
         _title = State(initialValue: reminder?.title ?? "")
         _notes = State(initialValue: reminder?.notes ?? "")
         _hasDueDate = State(initialValue: reminder?.dueDate != nil)
-        _dueDate = State(initialValue: reminder?.dueDate?.date() ?? Date())
+        let now = Date()
+        _dueDate = State(initialValue: reminder?.deadlineDate() ?? Calendar.current.date(byAdding: .hour, value: 2, to: now) ?? now)
+        _hasDueTime = State(initialValue: reminder?.dueDate == nil || reminder?.dueTime != nil)
+        _hasReminder = State(initialValue: reminder?.remindAt != nil)
+        _remindAt = State(initialValue: reminder?.remindAt ?? Calendar.current.date(byAdding: .hour, value: 1, to: now) ?? now)
     }
 
     private var trimmedTitle: String {
@@ -641,6 +767,15 @@ private struct ReminderEditor: View {
     private var selectedDueDate: DueDate? {
         guard hasDueDate else { return nil }
         return DueDate(date: dueDate)
+    }
+
+    private var selectedDueTime: DueTime? {
+        hasDueDate && hasDueTime ? DueTime(date: dueDate) : nil
+    }
+
+    private var selectedReminderDate: Date? {
+        guard hasReminder else { return nil }
+        return Calendar.current.dateInterval(of: .minute, for: remindAt)?.start ?? remindAt
     }
 
     var body: some View {
@@ -692,7 +827,7 @@ private struct ReminderEditor: View {
                         .font(.system(size: 13))
                         .scrollContentBackground(.hidden)
                         .padding(8)
-                        .frame(minHeight: 116, maxHeight: 150)
+                        .frame(minHeight: 80, maxHeight: 110)
                         .background(Color.white, in: RoundedRectangle(cornerRadius: 10))
                         .overlay {
                             RoundedRectangle(cornerRadius: 10)
@@ -701,24 +836,54 @@ private struct ReminderEditor: View {
                 }
 
                 VStack(alignment: .leading, spacing: 12) {
-                    Toggle("设置截止日期", isOn: $hasDueDate)
+                    Toggle("设置截止时间", isOn: $hasDueDate)
                         .font(.system(size: 13, weight: .medium))
                     if hasDueDate {
                         HStack {
-                            Label("截止日期", systemImage: "calendar")
+                            Label(hasDueTime ? "截止时间" : "截止日期", systemImage: "calendar")
                                 .font(.system(size: 12))
                                 .foregroundStyle(Color.mutedInk)
                             Spacer()
                             DatePicker(
-                                "截止日期",
+                                "截止时间",
                                 selection: $dueDate,
                                 in: Calendar.current.startOfDay(for: Date())...,
-                                displayedComponents: [.date]
+                                displayedComponents: hasDueTime ? [.date, .hourAndMinute] : [.date]
                             )
                             .labelsHidden()
                             .datePickerStyle(.compact)
                         }
                         .padding(.leading, 2)
+                        Toggle("选择具体时间", isOn: $hasDueTime)
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 11))
+                            .onChange(of: hasDueTime) { _, enabled in
+                                if enabled && dueDate <= Date() {
+                                    dueDate = Calendar.current.date(byAdding: .hour, value: 2, to: Date()) ?? Date()
+                                }
+                            }
+                        Text(hasDueTime ? "到截止时间自动移除事项。" : "全天事项在次日零点自动移除。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.mutedInk)
+                    }
+                }
+                .padding(14)
+                .background(Color.white.opacity(0.68), in: RoundedRectangle(cornerRadius: 12))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.cardBorder, lineWidth: 1)
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Toggle("提醒我", isOn: $hasReminder)
+                        .font(.system(size: 13, weight: .medium))
+                    if hasReminder {
+                        DatePicker("提醒时间", selection: $remindAt, displayedComponents: [.date, .hourAndMinute])
+                            .datePickerStyle(.compact)
+                            .font(.system(size: 12))
+                        Text("提醒时间须晚于现在；有截止时间时，须早于截止时间。需允许烂笔头发送系统通知。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.mutedInk)
                     }
                 }
                 .padding(14)
@@ -765,7 +930,7 @@ private struct ReminderEditor: View {
                 .keyboardShortcut(.cancelAction)
                 Button("保存") {
                     do {
-                        try onSave(title, notes, selectedDueDate)
+                        try onSave(title, notes, selectedDueDate, selectedDueTime, selectedReminderDate)
                         dismiss()
                     } catch {
                         report(error)
@@ -778,7 +943,7 @@ private struct ReminderEditor: View {
             }
         }
         .padding(26)
-        .frame(width: 490, height: 570)
+        .frame(width: 540, height: 700)
         .background(Color.pageBackground)
         .alert("无法完成操作", isPresented: $showingError) {
             Button("好", role: .cancel) { }

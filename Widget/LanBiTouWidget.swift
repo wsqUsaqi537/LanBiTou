@@ -31,11 +31,9 @@ private struct ReminderProvider: TimelineProvider {
                 updateDates.insert(nextDay)
             }
 
-            // Precompute the moment each future-dated reminder becomes expired.
+            // Precompute the moment each future reminder becomes expired.
             for reminder in reminders {
-                guard let dueDate = reminder.dueDate else { continue }
-                let dueDay = calendar.startOfDay(for: dueDate.date(calendar: calendar))
-                guard let expiration = calendar.date(byAdding: .day, value: 1, to: dueDay),
+                guard let expiration = reminder.expirationDate(calendar: calendar),
                       expiration > now else { continue }
                 updateDates.insert(expiration)
             }
@@ -192,7 +190,7 @@ private struct ReminderWidgetView: View {
 
     @ViewBuilder
     private func reminderRow(_ reminder: Reminder) -> some View {
-        if family == .systemSmall {
+        if family == .systemSmall || reminder.dueTime != nil {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 7) {
                     Circle()
@@ -234,8 +232,10 @@ private struct ReminderWidgetView: View {
     private func deadlineLabel(for reminder: Reminder) -> String {
         guard let dueDate = reminder.dueDate else { return "无期限" }
         let calendar = Calendar.current
-        if calendar.isDate(dueDate.date(calendar: calendar), inSameDayAs: entry.date) {
-            return "今天"
+        let isToday = calendar.isDate(dueDate.date(calendar: calendar), inSameDayAs: entry.date)
+        let timeLabel = reminder.dueTime.map { String(format: "%02d:%02d", $0.hour, $0.minute) }
+        if isToday {
+            return timeLabel.map { "今天 \($0)" } ?? "今天"
         }
         let dateLabel: String
         if dueDate.year == calendar.component(.year, from: entry.date) {
@@ -243,7 +243,7 @@ private struct ReminderWidgetView: View {
         } else {
             dateLabel = "\(dueDate.year)年\(dueDate.month)月\(dueDate.day)日"
         }
-        return "截止 \(dateLabel)"
+        return "截止 \(dateLabel)" + (timeLabel.map { " \($0)" } ?? "")
     }
 
     private var emptyState: some View {

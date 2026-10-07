@@ -81,7 +81,9 @@ private struct CloudSyncTests {
             title: "买咖啡豆",
             notes: "浅烘焙，带上优惠券",
             dueDate: DueDate(date: Date(timeIntervalSince1970: 1_748_966_400), calendar: calendar),
-            createdAt: createdAt
+            createdAt: createdAt,
+            dueTime: DueTime(hour: 18, minute: 45),
+            remindAt: Date(timeIntervalSince1970: 1_748_900_000.25)
         )
         let changeID = UUID(uuidString: "8F012345-6789-4ABC-8DEF-0123456789AB")!
         let entry = ReminderSyncEntry(
@@ -100,7 +102,7 @@ private struct CloudSyncTests {
         try expect(cloudRecord["payload"] as? Data != nil, "活动事项应写入payload")
 
         let decoded = try ReminderCloudRecordCodec.decode(cloudRecord)
-        try expect(decoded.record == entry.record, "ID、标题、备注、截止日、创建时间和版本应往返一致")
+        try expect(decoded.record == entry.record, "ID、标题、备注、截止日、截止时刻、自定义提醒和版本应往返一致")
         try expect(!decoded.needsUpload, "收到的云记录不应标记为待上传")
         try expect(decoded.cloudSystemFields != nil, "解码应归档record system fields")
     }

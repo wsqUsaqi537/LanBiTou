@@ -20,6 +20,11 @@ private func expect(_ condition: @autoclosure () throws -> Bool, _ message: Stri
     guard try condition() else { throw TestFailure.expectation(message) }
 }
 
+private func unwrap<T>(_ value: T?, _ message: String) throws -> T {
+    guard let value else { throw TestFailure.expectation(message) }
+    return value
+}
+
 private func utcCalendar() -> Calendar {
     var calendar = Calendar(identifier: .gregorian)
     calendar.timeZone = TimeZone(secondsFromGMT: 0)!
@@ -53,9 +58,19 @@ private func reminder(
     id: UUID,
     due: DueDate? = nil,
     createdAt: Date = Date(timeIntervalSince1970: 0),
-    notes: String = ""
+    notes: String = "",
+    dueTime: DueTime? = nil,
+    remindAt: Date? = nil
 ) -> Reminder {
-    Reminder(id: id, title: title, notes: notes, dueDate: due, createdAt: createdAt)
+    Reminder(
+        id: id,
+        title: title,
+        notes: notes,
+        dueDate: due,
+        createdAt: createdAt,
+        dueTime: dueTime,
+        remindAt: remindAt
+    )
 }
 
 /// Keeps repository tests entirely in memory; no standard or app-group defaults domain is touched.
@@ -93,12 +108,16 @@ private struct ReminderTests {
     static func main() {
         let tests: [(String, () throws -> Void)] = [
             ("截止日23:59:59仍有效，次日零点过期", testEndOfDueDateAndNextMidnight),
+            ("精确截止时刻的前一秒仍显示，到达时移除", testTimedDeadlineBoundary),
+            ("同日时刻按早晚排序，全天截止位于日末", testTimedDeadlineSorting),
             ("可见事项过滤过期项并保留无期限项", testVisibleFiltering),
             ("月末、年末和闰日按公历排序", testGregorianBoundaries),
             ("夏令时23小时和25小时日期按日历日判断", testDaylightSavingDays),
             ("时区变化不改变已存年月日", testTimeZoneChangePreservesCivilDate),
             ("事项按截止日、创建时间和ID稳定排序", testReminderSorting),
+            ("截止时间格式、提取和解码范围校验", testDueTimeValidation),
             ("事项与年月日截止日期可编码往返", testCodableRoundTrip),
+            ("旧事项JSON缺少提醒字段时读取为nil", testLegacyReminderWithoutNewFields),
             ("仓库可保存并读取事项", testRepositorySaveAndLoad),
             ("仓库保存后的新增、编辑和删除可读取", testRepositoryCreateEditDelete),
             ("首次迁移保留事项内容、ID和legacy原字节", testSyncMigrationPreservesLegacyData),
@@ -148,6 +167,37 @@ private struct ReminderTests {
         try expect(due.isExpired(at: nextMidnight, calendar: calendar), "次日零点应已过期")
     }
 
+    private static func testTimedDeadlineBoundary() throws {
+        let calendar = Calendar.current
+        let today = DueDate(date: Date(), calendar: calendar)
+        let item = reminder(
+            "今天十点截止",
+            id: UUID(),
+            due: today,
+            dueTime: DueTime(hour: 10, minute: 0)
+        )
+        let expiry = try unwrap(item.expirationDate(calendar: calendar), "时刻截止应有具体过期时点")
+
+        try expect(item.deadlineDate(calendar: calendar) == expiry, "时刻截止的显示日期应是具体截止点")
+        try expect(Reminder.visible(from: [item], at: expiry.addingTimeInterval(-1)).count == 1, "截止前一秒事项仍应显示")
+        try expect(Reminder.visible(from: [item], at: expiry).isEmpty, "到达截止时刻应立即移除事项")
+        try expect(Reminder.visible(from: [item], at: expiry.addingTimeInterval(1)).isEmpty, "截止后一秒事项应已移除")
+    }
+
+    private static func testTimedDeadlineSorting() throws {
+        let calendar = Calendar.current
+        let today = DueDate(date: Date(), calendar: calendar)
+        let morning = reminder("09:00", id: UUID(), due: today, dueTime: DueTime(hour: 9, minute: 0))
+        let afternoon = reminder("15:00", id: UUID(), due: today, dueTime: DueTime(hour: 15, minute: 0))
+        let allDay = reminder("全天", id: UUID(), due: today)
+        let noDeadline = reminder("无期限", id: UUID())
+        let atStartOfDay = today.date(calendar: calendar)
+        let sorted = Reminder.visible(from: [noDeadline, allDay, afternoon, morning], at: atStartOfDay)
+
+        try expect(sorted.map(\.title) == ["09:00", "15:00", "全天", "无期限"], "同日应按时刻排序，全天截止按日末，无期限排最后")
+        try expect(morning.dueTime?.timeLabel == "09:00", "截止时间标签应使用HH:mm格式")
+    }
+
     private static func testVisibleFiltering() throws {
         let calendar = Calendar.current
         let today = DueDate(date: Date(), calendar: calendar)
@@ -189,8 +239,10 @@ private struct ReminderTests {
 
             let due = DueDate(date: start, calendar: calendar)
             let finalSecond = interval.end.addingTimeInterval(-1)
+            let legacy = reminder("全天", id: UUID(), due: due)
             try expect(!due.isExpired(at: finalSecond, calendar: calendar), "夏令时切换日结束前不应过期")
             try expect(due.isExpired(at: interval.end, calendar: calendar), "夏令时切换日后的零点应过期")
+            try expect(legacy.expirationDate(calendar: calendar) == interval.end, "全天截止过期点应是夏令时日期的次日零点")
         }
     }
 
@@ -229,17 +281,48 @@ private struct ReminderTests {
 
     private static func testCodableRoundTrip() throws {
         let calendar = utcCalendar()
+        let remindAt = try date(2024, 2, 28, 8, 15, calendar: calendar)
         let item = reminder(
             "跨日任务",
             id: UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!,
             due: DueDate(date: try date(2024, 2, 29, calendar: calendar), calendar: calendar),
             createdAt: try date(2024, 2, 1, 12, 34, 56, calendar: calendar),
-            notes: "保留备注"
+            notes: "保留备注",
+            dueTime: DueTime(hour: 9, minute: 5),
+            remindAt: remindAt
         )
         let encoded = try JSONEncoder().encode(item)
         let decoded = try JSONDecoder().decode(Reminder.self, from: encoded)
         try expect(decoded == item, "JSON往返后的事项字段应完全一致")
         try expect(String(data: encoded, encoding: .utf8)?.contains("\"year\":2024") == true, "截止日期JSON应保存公历字段")
+        try expect(decoded.dueTime?.timeLabel == "09:05", "截止时刻应编码并解码")
+        try expect(decoded.remindAt == remindAt, "自定义提醒日期应编码并解码")
+    }
+
+    private static func testLegacyReminderWithoutNewFields() throws {
+        let legacyJSON = Data(#"{"id":"01234567-89AB-CDEF-0123-456789ABCDEF","title":"旧事项","notes":"","dueDate":null,"createdAt":0}"#.utf8)
+        let decoded = try JSONDecoder().decode(Reminder.self, from: legacyJSON)
+
+        try expect(decoded.dueTime == nil, "旧JSON未提供截止时刻时应读取为nil")
+        try expect(decoded.remindAt == nil, "旧JSON未提供提醒日期时应读取为nil")
+    }
+
+    private static func testDueTimeValidation() throws {
+        let calendar = utcCalendar()
+        let source = try date(2025, 6, 15, 8, 7, 59, calendar: calendar)
+        let extracted = DueTime(date: source, calendar: calendar)
+        try expect(extracted == DueTime(hour: 8, minute: 7), "从日期提取时应保留当地小时和分钟")
+        try expect(extracted.timeLabel == "08:07", "时间标签应补足两位数字")
+        try expect(DueTime(hour: 8, minute: 7) < DueTime(hour: 8, minute: 8), "截止时间应按小时和分钟比较")
+
+        for invalidJSON in [#"{"hour":24,"minute":0}"#, #"{"hour":0,"minute":60}"#, #"{"hour":-1,"minute":0}"#] {
+            do {
+                _ = try JSONDecoder().decode(DueTime.self, from: Data(invalidJSON.utf8))
+            } catch {
+                continue
+            }
+            throw TestFailure.expectation("超出范围的截止时间不应解码：\(invalidJSON)")
+        }
     }
 
     private static func testRepositorySaveAndLoad() throws {

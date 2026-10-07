@@ -6,7 +6,7 @@
 
 Mac 与未来的 iPhone 版使用同一个 CloudKit **私有数据库**、`LanBiTouReminders` zone 和 `ReminderV1` record type。各人的事项保存在自己的 iCloud 账户中。共享代码最低支持 macOS 14 / iOS 17，采用 Apple 的 [CKSyncEngine](https://developer.apple.com/documentation/cloudkit/cksyncengine-5sie5) 管理变更和重试。
 
-- 标题、备注、可选截止日期以及新增、编辑、删除全部同步。截止日期保存公历年月日，避免跨时区变成另一天。
+- 标题、备注、可选截止日期和时分、可选提醒时间以及新增、编辑、删除全部同步。截止日期与时分保存本地公历值；提醒时间保存绝对时间点。通知授权和显示设置由各设备单独管理，不参与同步。
 - 每条事项保留稳定 UUID；每次改变保存 `modifiedAt` 和稳定的 `changeID`。
 - 按用户选择，所有操作以最后操作时间为准。删除保存为带版本的空内容记录，较晚的编辑可以使事项重新出现；较早的离线编辑无法覆盖较晚删除。
 - 相同时间以 `changeID` 排序，保证两端一致。时间来自设备时钟，应使用系统自动日期和时间；设备时钟偏差仍会影响“最后”的判断。
